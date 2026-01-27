@@ -7,6 +7,11 @@ import hashlib
 import time
 import yaml
 import logging
+from src.config_manager import config
+
+# Register host network configuration
+config.register_config("USE_HOST_NETWORK", default=False, type_cast=bool,
+                      description="Use host network mode for Docker containers (useful for proxy environments)")
 
 def generate_network_name(dataset_path, shared=False):
     """
@@ -168,7 +173,80 @@ def add_network_to_docker_compose(docker_compose_path, network_name):
             # Default network already exists, don't modify
             print(f"Default network already exists in {docker_compose_path}, not modifying")
             return True
-            
+
     except Exception as e:
         print(f"Error adding network to docker-compose file {docker_compose_path}: {str(e)}")
-        return False 
+        return False
+
+
+def add_host_network_to_docker_compose(docker_compose_path):
+    """
+    Modify a docker-compose file to use host network mode.
+    This allows containers to share the host's network stack, including proxy settings.
+
+    Args:
+        docker_compose_path (str): Path to the docker-compose.yml file
+
+    Returns:
+        bool: True if modified successfully, False on error
+    """
+    try:
+        # Read the docker-compose file
+        with open(docker_compose_path, 'r') as f:
+            data = yaml.safe_load(f)
+
+        # If the file is empty or invalid, skip
+        if not data or 'services' not in data:
+            return False
+
+        # Add network_mode: host to all services and build network: host
+        for _, service_config in data['services'].items():
+            # Remove any existing network configuration (incompatible with network_mode: host)
+            if 'networks' in service_config:
+                del service_config['networks']
+            # Add host network mode for runtime
+            service_config['network_mode'] = 'host'
+
+            # Add host network for build phase (so pip install etc. can access internet)
+            if 'build' in service_config:
+                # If build is a string (just a path), convert to dict
+                if isinstance(service_config['build'], str):
+                    service_config['build'] = {
+                        'context': service_config['build'],
+                        'network': 'host'
+                    }
+                elif isinstance(service_config['build'], dict):
+                    service_config['build']['network'] = 'host'
+            else:
+                # Check if there's a Dockerfile in the same directory
+                docker_dir = os.path.dirname(docker_compose_path)
+                if os.path.exists(os.path.join(docker_dir, 'Dockerfile')):
+                    service_config['build'] = {
+                        'context': '.',
+                        'network': 'host'
+                    }
+
+        # Remove top-level networks section if it exists (incompatible with network_mode: host)
+        if 'networks' in data:
+            del data['networks']
+
+        # Write the updated docker-compose file
+        with open(docker_compose_path, 'w') as f:
+            yaml.dump(data, f, default_flow_style=False)
+
+        print(f"Added host network mode to {docker_compose_path}")
+        return True
+
+    except Exception as e:
+        print(f"Error adding host network to docker-compose file {docker_compose_path}: {str(e)}")
+        return False
+
+
+def should_use_host_network():
+    """
+    Check if host network mode should be used based on configuration.
+
+    Returns:
+        bool: True if USE_HOST_NETWORK is enabled in config
+    """
+    return config.get("USE_HOST_NETWORK", False)

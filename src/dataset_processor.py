@@ -1630,25 +1630,43 @@ class AgenticProcessor (DatasetProcessor):
             }
         else:
             # Use traditional directory-based mounting
-            docker_compose = {
-                'services': {
-                    'agent': {
-                        'image': agent,
-                        'volumes': [
-                            './docs:/code/docs',
-                            './rtl:/code/rtl',
-                            './verif:/code/verif',
-                            './rundir:/code/rundir',
-                            './prompt.json:/code/prompt.json'
-                        ],
-                        'working_dir': '/code',
-                        'environment': {
-                            'OPENAI_USER_KEY': config.get('OPENAI_USER_KEY', '')
+            # For mi6_code_agent, mount entire directory to capture out.sv at /code root
+            if 'mi6_code_agent' in agent:
+                docker_compose = {
+                    'services': {
+                        'agent': {
+                            'image': agent,
+                            'volumes': [
+                                '.:/code'
+                            ],
+                            'working_dir': '/code',
+                            'environment': {
+                                'OPENAI_USER_KEY': config.get('OPENAI_USER_KEY', '')
+                            }
                         }
                     }
                 }
-            }
-            print("[INFO] Using traditional directory-based mounting")
+                print("[INFO] Using full directory mount for mi6_code_agent")
+            else:
+                docker_compose = {
+                    'services': {
+                        'agent': {
+                            'image': agent,
+                            'volumes': [
+                                './docs:/code/docs',
+                                './rtl:/code/rtl',
+                                './verif:/code/verif',
+                                './rundir:/code/rundir',
+                                './prompt.json:/code/prompt.json'
+                            ],
+                            'working_dir': '/code',
+                            'environment': {
+                                'OPENAI_USER_KEY': config.get('OPENAI_USER_KEY', '')
+                            }
+                        }
+                    }
+                }
+                print("[INFO] Using traditional directory-based mounting")
         
         # Add golden patch to volumes if it exists
         if hasattr(self, 'include_golden_patch') and self.include_golden_patch:
@@ -1661,19 +1679,30 @@ class AgenticProcessor (DatasetProcessor):
         if hasattr(self, 'include_harness') and self.include_harness:
             # The issue_path already contains the test harness necessary files
             # created by the Repository.prepare() method
-            
+
             # First, make sure src directory exists and is populated
             src_dir = os.path.join(issue_path, "src")
             if os.path.exists(src_dir):
                 docker_compose['services']['agent']['volumes'].append('./src:/code/src')
                 print("Test harness src directory will be mounted in the agent container at /code/src")
-                            
+
             # Add the docker-compose.yml file that was used to run the tests
             docker_compose_yml = os.path.join(issue_path, "docker-compose.yml")
             if os.path.exists(docker_compose_yml):
                 docker_compose['services']['agent']['volumes'].append('./docker-compose.yml:/code/docker-compose.yml')
                 print("Original docker-compose.yml will be mounted in the agent container at /code/docker-compose.yml")
-        
+
+        # Add mi6_code_agent specific environment variables
+        if 'mi6_code_agent' in agent:
+            mi6_env = {
+                'MI6_BASE_URL': config.get('MI6_BASE_URL', 'https://api.deepseek.com/'),
+                'MI6_MODEL': config.get('MI6_MODEL', 'deepseek:deepseek-reasoner'),
+                'MI6_API_KEY': config.get('MI6_API_KEY', ''),
+                'MI6_TIMEOUT': str(config.get('MI6_TIMEOUT', 300))
+            }
+            docker_compose['services']['agent']['environment'].update(mi6_env)
+            print("[INFO] Added mi6_code_agent environment variables")
+
         # Add network configuration if we have a network name
         if hasattr(self, 'network_name') and self.network_name:
             docker_compose['networks'] = {
@@ -2039,99 +2068,153 @@ class AgenticProcessor (DatasetProcessor):
                     os.makedirs(src, exist_ok=True)
                     if os.path.exists(bak): shutil.rmtree(bak)
                     shutil.copytree(src, bak)
-                
+
                 if not self.golden:
-                    # Run agent
-                    agent_status, agent_logfile = self.agent_run(issue_path, self.agent)
-                
-                    # Store agent log file info
-                    result['agent_logfile'] = agent_logfile
-                    
-                    if agent_status != 0:
-                        error_msg = f"Agent process exited with non-zero status: {agent_status}"
-                        logging.error(error_msg)
-                        # Store error but also continue to process any files that might have been created
-                        result['agent_error'] = error_msg
-                    
-                    # Clean up any stray Docker resources (with error suppression)
-                    try:
-                        # Extract issue ID and repo name for project name pattern
-                        issue_id_str = str(issue_id)
-                        harness_dir = os.path.dirname(issue_path)
-                        repo_name_base = os.path.basename(os.path.dirname(harness_dir))
-                        
-                        # Format repo_name to comply with Docker naming requirements
-                        formatted_repo = ''.join(c.lower() if c.isalnum() or c == '-' or c == '_' else '_' for c in repo_name_base)
-                        if not formatted_repo[0].isalnum():
-                            formatted_repo = 'p' + formatted_repo
-                        
-                        # Clean up any networks with similar pattern
-                        cleanup_cmd = f"docker network ls --filter name=agent_{formatted_repo}_{issue_id_str} -q | xargs -r docker network rm 2>/dev/null || true"
-                        subprocess.run(cleanup_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except Exception:
-                        # Completely suppress errors from cleanup
-                        pass
-                    
-                    # Process differences even if agent had errors, in case partial results were created
-                    # Track all changes in a single unified patch
-                    unified_patch = []
-                
-                    for d in dir_names:
-                        orig_dir = os.path.join(before_dir, d)
-                        mod_dir = os.path.join(issue_path, d)
-                        orig_files = {f: os.path.join(orig_dir, f) for f in self._get_files(orig_dir)}
-                        mod_files = {f: os.path.join(mod_dir, f) for f in self._get_files(mod_dir)}
-                    
-                        # Handle added and modified files
-                        for rel_path, mod_path in mod_files.items():
-                            context_path = os.path.join(d, rel_path)
-                            try:
-                                with open(mod_path, 'r', encoding='utf-8', errors='replace') as f:
-                                    mod_content = f.read()
-                                
-                                # Added or modified file
-                                if rel_path not in orig_files:
-                                    # New file - use directly
-                                    result[context_path] = mod_content
-                                    # Add new file to unified patch
-                                    unified_patch.append(f"--- /dev/null\n+++ b/{context_path}\n@@ -0,0 +1,{len(mod_content.splitlines())} @@")
-                                    for line in mod_content.splitlines():
-                                        unified_patch.append(f"+{line}")
-                                    unified_patch.append("")  # Empty line between files
-                                else:
-                                    with open(orig_files[rel_path], 'r', encoding='utf-8', errors='replace') as f:
-                                        orig_content = f.read()
-                                    if orig_content != mod_content:
-                                        # Add diff to unified patch
-                                        diff = self._diff(orig_content, mod_content, context_path)
-                                        unified_patch.append(diff)
-                                        unified_patch.append("")  # Empty line between files
-                                        # Use modified content directly
-                                        result[context_path] = mod_content
-                            except Exception as file_e:
-                                file_error = f"Error processing {mod_path}: {str(file_e)}"
-                                logging.error(file_error)
-                                # Store the file-specific error but continue processing other files
-                                result[f'file_error_{context_path}'] = file_error
-                    
-                        # Handle deleted files
-                        for rel_path, orig_path in orig_files.items():
-                            if rel_path not in mod_files:
+                    # Check if this is mi6_code_agent - needs special handling
+                    if self._is_mi6_agent(self.agent):
+                        # Get target files from patch dictionary
+                        patch_data = self.context[id].get('patch', {})
+                        target_files = list(patch_data.keys()) if patch_data else []
+
+                        if not target_files:
+                            logging.warning(f"No target files found in patch for {id}")
+                            target_files = ['rtl/out.sv']  # Fallback
+
+                        unified_patch = []
+                        base_prompt = self.context[id]['prompt']
+                        context_data = self.context[id].get('context', {})
+
+                        # Run agent once per target file
+                        for target_file in target_files:
+                            print(f"Running mi6 agent for target file: {target_file}")
+
+                            # Create modified prompt for this specific file (with interface info from testbench)
+                            file_prompt = self._create_mi6_prompt_for_file(base_prompt, target_file, context_data)
+
+                            # Update prompt.json with file-specific prompt
+                            prompt_json_path = os.path.join(issue_path, 'prompt.json')
+                            with open(prompt_json_path, 'w') as f:
+                                json.dump({"prompt": file_prompt}, f)
+
+                            # Run agent
+                            agent_status, agent_logfile = self.agent_run(issue_path, self.agent)
+                            result['agent_logfile'] = agent_logfile
+
+                            if agent_status != 0:
+                                error_msg = f"Agent process exited with non-zero status: {agent_status} for {target_file}"
+                                logging.error(error_msg)
+                                result['agent_error'] = result.get('agent_error', '') + error_msg + '\n'
+                                continue
+
+                            # Handle mi6 output: move file and generate diff
+                            content, diff = self._handle_mi6_output(issue_path, target_file, before_dir)
+
+                            if content:
+                                result[target_file] = content
+                                if diff:
+                                    unified_patch.append(diff)
+                            else:
+                                result[f'file_error_{target_file}'] = f"Failed to process mi6 output for {target_file}"
+
+                        # Write unified patch file
+                        if unified_patch:
+                            patch_file = os.path.join(issue_path, "agent_changes.patch")
+                            with open(patch_file, 'w', encoding='utf-8') as f:
+                                f.write('\n'.join(unified_patch))
+                            result['agent_patch_file'] = patch_file
+                    else:
+                        # Original agent processing (non-mi6)
+                        # Run agent
+                        agent_status, agent_logfile = self.agent_run(issue_path, self.agent)
+
+                        # Store agent log file info
+                        result['agent_logfile'] = agent_logfile
+
+                        if agent_status != 0:
+                            error_msg = f"Agent process exited with non-zero status: {agent_status}"
+                            logging.error(error_msg)
+                            # Store error but also continue to process any files that might have been created
+                            result['agent_error'] = error_msg
+
+                        # Clean up any stray Docker resources (with error suppression)
+                        try:
+                            # Extract issue ID and repo name for project name pattern
+                            issue_id_str = str(issue_id)
+                            harness_dir = os.path.dirname(issue_path)
+                            repo_name_base = os.path.basename(os.path.dirname(harness_dir))
+
+                            # Format repo_name to comply with Docker naming requirements
+                            formatted_repo = ''.join(c.lower() if c.isalnum() or c == '-' or c == '_' else '_' for c in repo_name_base)
+                            if not formatted_repo[0].isalnum():
+                                formatted_repo = 'p' + formatted_repo
+
+                            # Clean up any networks with similar pattern
+                            cleanup_cmd = f"docker network ls --filter name=agent_{formatted_repo}_{issue_id_str} -q | xargs -r docker network rm 2>/dev/null || true"
+                            subprocess.run(cleanup_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        except Exception:
+                            # Completely suppress errors from cleanup
+                            pass
+
+                        # Process differences even if agent had errors, in case partial results were created
+                        # Track all changes in a single unified patch
+                        unified_patch = []
+
+                        for d in dir_names:
+                            orig_dir = os.path.join(before_dir, d)
+                            mod_dir = os.path.join(issue_path, d)
+                            orig_files = {f: os.path.join(orig_dir, f) for f in self._get_files(orig_dir)}
+                            mod_files = {f: os.path.join(mod_dir, f) for f in self._get_files(mod_dir)}
+
+                            # Handle added and modified files
+                            for rel_path, mod_path in mod_files.items():
                                 context_path = os.path.join(d, rel_path)
-                                with open(orig_path, 'r', encoding='utf-8', errors='replace') as f:
-                                    orig_content = f.read()
-                                # Add deletion to unified patch
-                                unified_patch.append(f"--- a/{context_path}\n+++ /dev/null\n@@ -1,{len(orig_content.splitlines())} +0,0 @@")
-                                for line in orig_content.splitlines():
-                                    unified_patch.append(f"-{line}")
-                                unified_patch.append("")  # Empty line between files
-            
-                    # Write the unified patch file
-                    if unified_patch:
-                        patch_file = os.path.join(issue_path, "agent_changes.patch")
-                        with open(patch_file, 'w', encoding='utf-8') as f:
-                            f.write('\n'.join(unified_patch))
-                        result['agent_patch_file'] = patch_file
+                                try:
+                                    with open(mod_path, 'r', encoding='utf-8', errors='replace') as f:
+                                        mod_content = f.read()
+
+                                    # Added or modified file
+                                    if rel_path not in orig_files:
+                                        # New file - use directly
+                                        result[context_path] = mod_content
+                                        # Add new file to unified patch
+                                        unified_patch.append(f"--- /dev/null\n+++ b/{context_path}\n@@ -0,0 +1,{len(mod_content.splitlines())} @@")
+                                        for line in mod_content.splitlines():
+                                            unified_patch.append(f"+{line}")
+                                        unified_patch.append("")  # Empty line between files
+                                    else:
+                                        with open(orig_files[rel_path], 'r', encoding='utf-8', errors='replace') as f:
+                                            orig_content = f.read()
+                                        if orig_content != mod_content:
+                                            # Add diff to unified patch
+                                            diff = self._diff(orig_content, mod_content, context_path)
+                                            unified_patch.append(diff)
+                                            unified_patch.append("")  # Empty line between files
+                                            # Use modified content directly
+                                            result[context_path] = mod_content
+                                except Exception as file_e:
+                                    file_error = f"Error processing {mod_path}: {str(file_e)}"
+                                    logging.error(file_error)
+                                    # Store the file-specific error but continue processing other files
+                                    result[f'file_error_{context_path}'] = file_error
+
+                            # Handle deleted files
+                            for rel_path, orig_path in orig_files.items():
+                                if rel_path not in mod_files:
+                                    context_path = os.path.join(d, rel_path)
+                                    with open(orig_path, 'r', encoding='utf-8', errors='replace') as f:
+                                        orig_content = f.read()
+                                    # Add deletion to unified patch
+                                    unified_patch.append(f"--- a/{context_path}\n+++ /dev/null\n@@ -1,{len(orig_content.splitlines())} +0,0 @@")
+                                    for line in orig_content.splitlines():
+                                        unified_patch.append(f"-{line}")
+                                    unified_patch.append("")  # Empty line between files
+
+                        # Write the unified patch file
+                        if unified_patch:
+                            patch_file = os.path.join(issue_path, "agent_changes.patch")
+                            with open(patch_file, 'w', encoding='utf-8') as f:
+                                f.write('\n'.join(unified_patch))
+                            result['agent_patch_file'] = patch_file
             
             # Store the results for later use
             self.agent_results[id] = result
@@ -2193,6 +2276,160 @@ class AgenticProcessor (DatasetProcessor):
             original.splitlines(), modified.splitlines(),
             fromfile=f'a/{path}', tofile=f'b/{path}', lineterm=''
         ))
+
+    def _is_mi6_agent(self, agent_name: str) -> bool:
+        """Check if the agent is mi6_code_agent."""
+        return agent_name and 'mi6_code_agent' in agent_name
+
+    def _handle_mi6_output(self, issue_path: str, target_path: str, before_dir: str) -> tuple:
+        """
+        Handle mi6 agent output: move generated file to target path and generate diff.
+
+        Args:
+            issue_path: Path to the issue directory
+            target_path: Target file path relative to issue_path (e.g., 'rtl/top_module.sv')
+            before_dir: Path to the before snapshot directory
+
+        Returns:
+            Tuple of (file_content, diff_content) or (None, None) if failed
+        """
+        mi6_output = os.path.join(issue_path, 'out.sv')
+
+        if not os.path.exists(mi6_output):
+            logging.error(f"mi6 output file not found: {mi6_output}")
+            return None, None
+
+        # Read generated content
+        with open(mi6_output, 'r', encoding='utf-8', errors='replace') as f:
+            generated_content = f.read()
+
+        # Determine full target path
+        full_target_path = os.path.join(issue_path, target_path)
+        target_dir = os.path.dirname(full_target_path)
+        os.makedirs(target_dir, exist_ok=True)
+
+        # Check if original file exists (for diff generation)
+        original_path = os.path.join(before_dir, target_path)
+        original_content = ''
+        if os.path.exists(original_path):
+            with open(original_path, 'r', encoding='utf-8', errors='replace') as f:
+                original_content = f.read()
+
+        # Move generated file to target location
+        shutil.move(mi6_output, full_target_path)
+        print(f"Moved mi6 output to: {full_target_path}")
+
+        # Generate diff using GNU diff
+        diff_content = self._generate_gnu_diff(original_content, generated_content, target_path)
+
+        return generated_content, diff_content
+
+    def _generate_gnu_diff(self, original: str, modified: str, path: str) -> str:
+        """
+        Generate unified diff using GNU diff command.
+
+        Args:
+            original: Original file content (empty string for new files)
+            modified: Modified file content
+            path: File path for diff header
+
+        Returns:
+            Unified diff string
+        """
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.orig', delete=False) as orig_f:
+            orig_f.write(original)
+            orig_path = orig_f.name
+
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.new', delete=False) as new_f:
+            new_f.write(modified)
+            new_path = new_f.name
+
+        try:
+            # Use GNU diff with unified format
+            result = subprocess.run(
+                ['diff', '-u', '--label', f'a/{path}', '--label', f'b/{path}', orig_path, new_path],
+                capture_output=True, text=True
+            )
+            # diff returns 1 if files differ, 0 if same, 2 on error
+            if result.returncode == 2:
+                logging.error(f"GNU diff error: {result.stderr}")
+                return ''
+            return result.stdout
+        finally:
+            os.unlink(orig_path)
+            os.unlink(new_path)
+
+    def _create_mi6_prompt_for_file(self, base_prompt: str, target_file: str, context_data: dict = None) -> str:
+        """
+        Create a modified prompt for mi6 agent targeting a specific file.
+
+        Args:
+            base_prompt: Original prompt from the dataset
+            target_file: Target file path (e.g., 'rtl/top_module.sv')
+            context_data: Context dictionary containing testbench and other files
+
+        Returns:
+            Modified prompt with file-specific instructions and interface info
+        """
+        file_instruction = f"\n\nIMPORTANT: Generate ONLY the file '{target_file}'. Output the complete SystemVerilog code for this file."
+
+        # Extract interface information from testbench if available
+        interface_info = self._extract_interface_from_context(context_data, target_file)
+        if interface_info:
+            file_instruction += f"\n\n{interface_info}"
+
+        return base_prompt + file_instruction
+
+    def _extract_interface_from_context(self, context_data: dict, target_file: str) -> str:
+        """
+        Extract expected module interface from testbench files in context.
+
+        Args:
+            context_data: Context dictionary containing testbench and other files
+            target_file: Target RTL file path
+
+        Returns:
+            String describing the expected interface, or empty string if not found
+        """
+        if not context_data:
+            return ""
+
+        # Look for testbench files in context
+        testbench_content = None
+        for file_path, content in context_data.items():
+            if 'verif' in file_path and ('_tb.sv' in file_path or '_tb.v' in file_path or 'test_' in file_path):
+                testbench_content = content
+                break
+
+        if not testbench_content:
+            return ""
+
+        # Extract module instantiation from testbench to determine expected interface
+        import re
+
+        # Get module name from target file (e.g., 'rtl/fixed_priority_arbiter.sv' -> 'fixed_priority_arbiter')
+        module_name = os.path.splitext(os.path.basename(target_file))[0]
+
+        # Look for module instantiation pattern in testbench
+        # Pattern: module_name instance_name ( .port(signal), ... );
+        inst_pattern = rf'{module_name}\s+\w+\s*\(([\s\S]*?)\);'
+        match = re.search(inst_pattern, testbench_content)
+
+        if match:
+            instantiation = match.group(0)
+            # Extract port connections
+            port_pattern = r'\.(\w+)\s*\('
+            ports = re.findall(port_pattern, instantiation)
+
+            if ports:
+                interface_info = f"CRITICAL: The module '{module_name}' MUST have EXACTLY these port names to match the testbench:\n"
+                interface_info += f"  Ports: {', '.join(ports)}\n"
+                interface_info += f"\nTestbench instantiation for reference:\n```systemverilog\n{instantiation}\n```"
+                return interface_info
+
+        return ""
 
     def all_prepare(self, model : OpenAI_Instance = None):
         """

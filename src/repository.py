@@ -226,7 +226,28 @@ class Repository:
 
             # Apply centralized template substitution for EDA infrastructure
             content = apply_template_substitution(content)
-            
+
+            # Fix outdated cocotb in Dockerfile - add cocotb upgrade for cocotb.runner support
+            if file == 'Dockerfile' or file.endswith('/Dockerfile'):
+                # Check if this Dockerfile uses pip/pip3 and doesn't already install cocotb>=1.7
+                if ('pip install' in content or 'pip3 install' in content) and 'cocotb>=' not in content and 'cocotb==' not in content:
+                    # Pin cocotb to 1.9.x which has cocotb.runner (removed in 2.0)
+                    # Handle both pip and pip3, and both cocotb_bus and cocotb-bus
+                    import re
+                    # Match: RUN pip/pip3 install cocotb_bus or cocotb-bus
+                    pattern = r'RUN (pip3?) install (cocotb[-_]bus)'
+                    replacement = r'RUN \1 install "cocotb>=1.9.0,<2.0.0" \2'
+                    new_content = re.sub(pattern, replacement, content)
+                    if new_content != content:
+                        content = new_content
+                        print(f"Updated Dockerfile to install cocotb 1.9.x for cocotb.runner support")
+
+            # Fix cocotb 2.0 compatibility - cocotb.runner was moved to cocotb_tools.runner
+            if 'test_runner' in file and file.endswith('.py'):
+                if 'from cocotb.runner' in content:
+                    content = content.replace('from cocotb.runner', 'from cocotb_tools.runner')
+                    print(f"Updated {file} to use cocotb_tools.runner for cocotb 2.0 compatibility")
+
             # Add license network configuration for commercial EDA datapoints
             if self.requires_eda_license and file.endswith('docker-compose.yml'):
                 license_network_name = config.get('LICENSE_NETWORK')
@@ -363,14 +384,20 @@ class Repository:
 
         return {"result" : returncode, "log" : logfile, "error_msg" : None, "execution" : time.time() - start_time, "pid": pid}
 
-    def log_docker(self, docker : str = "", cmd : str = "", service : str = "", logfile : str = "", 
+    def log_docker(self, docker : str = "", cmd : str = "", service : str = "", logfile : str = "",
                   monitor_size=True):
         # Ensure docker variable is absolute path
         docker = os.path.abspath(docker)
-        
-        # Ensure docker-compose file has network configuration before proceeding
-        # This is the correct place to configure networks - when generating the shell script
-        if self.network_name:
+
+        # Check if we should use host network mode (for proxy environments)
+        if network_util.should_use_host_network():
+            try:
+                print(f"Applying host network mode to {docker}")
+                network_util.add_host_network_to_docker_compose(docker)
+            except Exception as e:
+                print(f"Warning: Failed to add host network mode to {docker}: {str(e)}")
+        # Otherwise, ensure docker-compose file has network configuration before proceeding
+        elif self.network_name:
             try:
                 print(f"Ensuring {docker} has correct network configuration")
                 network_util.add_network_to_docker_compose(docker, self.network_name)
@@ -465,6 +492,19 @@ class Repository:
             script_file.write(f"  docker compose -f {docker} -p {project_name} run --rm --user $USER_ID:$GROUP_ID -e HOME=/code/rundir {cmd} {service}\n")
             script_file.write(f"fi\n")
             script_file.write(f"exit_code=$?\n\n")
+
+            # Append build logs (sim.log, build.log) if they exist - these contain actual compiler errors
+            script_file.write(f"# Append build logs if they exist (contains actual compiler/tool errors)\n")
+            script_file.write(f"SCRIPT_DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n")
+            script_file.write(f"for logfile in \"$SCRIPT_DIR/rundir/sim.log\" \"$SCRIPT_DIR/rundir/sim_build/sim.log\" \"$SCRIPT_DIR/rundir/build.log\"; do\n")
+            script_file.write(f"  if [ -f \"$logfile\" ] && [ -s \"$logfile\" ]; then\n")
+            script_file.write(f"    echo \"\"\n")
+            script_file.write(f"    echo \"=== Build Log: $logfile ===\"\n")
+            script_file.write(f"    cat \"$logfile\"\n")
+            script_file.write(f"    echo \"=== End Build Log ===\"\n")
+            script_file.write(f"  fi\n")
+            script_file.write(f"done\n\n")
+
             script_file.write(f"# Exit with the same code as the docker command\n")
             script_file.write(f"exit $exit_code\n")
 
