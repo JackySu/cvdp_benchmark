@@ -1,3 +1,9 @@
+# MI6 Notice
+
+1. `for_mi6.md` has everything you need to run with or w/o mi6 code agents
+
+2. `CVDP_WORK_DIRECTORY_STRUCTURE.md` has full file structure of the report directory, useful for debugging
+
 # CVDP Benchmark
 
 The CVDP Benchmark is a framework for evaluating LLM and agent solutions on hardware verification challenges.
