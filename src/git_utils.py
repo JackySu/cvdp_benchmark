@@ -69,7 +69,7 @@ class GitRepositoryManager:
                 print("[INFO] Docker image 'patch_image' not found, building it...")
                 
                 # Create temporary dockerfile
-                dockerfile_content = "FROM ubuntu:22.04\nRUN apt update && apt install -y git"
+                dockerfile_content = "FROM registry.cn-shanghai.aliyuncs.com/icb/ubuntu:24.04\nRUN apt update && apt install -y git"
                 dockerfile_path = os.path.join(self.cache_dir, "Dockerfile.patch_image")
                 
                 with open(dockerfile_path, "w") as f:
